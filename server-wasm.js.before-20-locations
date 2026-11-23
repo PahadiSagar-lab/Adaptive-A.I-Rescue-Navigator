@@ -1,0 +1,400 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const createRescueModule = require('./public/rescue_engine.js');
+
+const PORT = process.env.PORT || 3000;
+const DB = path.join(__dirname, 'map.json');
+const PUBLIC = path.join(__dirname, 'public');
+
+const seed = {
+  locations: ['RescueCenter', 'Hospital', 'ISBT', 'ClementTown', 'DisasterZone'],
+  roads: [
+    ['RescueCenter', 'Hospital', 4, false],
+    ['RescueCenter', 'ISBT', 6, false],
+    ['Hospital', 'ClementTown', 3, false],
+    ['ISBT', 'ClementTown', 2, false],
+    ['ClementTown', 'DisasterZone', 5, false]
+  ]
+};
+
+function saveMap(map) {
+  fs.writeFileSync(DB, JSON.stringify(map, null, 2));
+}
+
+function loadMap() {
+  try {
+    const map = JSON.parse(fs.readFileSync(DB, 'utf8'));
+    if (!Array.isArray(map.locations) || !Array.isArray(map.roads)) {
+      throw new Error('Invalid map');
+    }
+    return map;
+  } catch {
+    const map = JSON.parse(JSON.stringify(seed));
+    saveMap(map);
+    return map;
+  }
+}
+
+let map = loadMap();
+let Module;
+let weather = 'Clear';
+
+function call(name, returnType, argTypes = [], args = []) {
+  return Module.ccall(name, returnType, argTypes, args);
+}
+
+const engine = {
+  init() {
+    call('wasm_init', null);
+  },
+
+  addLocation(name) {
+    return call('wasm_add_location', 'number', ['string'], [name]);
+  },
+
+  addRoad(from, to, cost) {
+    return call(
+      'wasm_add_road', 'number',
+      ['string', 'string', 'number'], [from, to, cost]
+    );
+  },
+
+  setBlocked(from, to, blocked) {
+    return call(
+      'wasm_set_road_blocked', 'number',
+      ['string', 'string', 'number'], [from, to, blocked ? 1 : 0]
+    );
+  },
+
+  getMap() {
+    const count = call('wasm_location_count', 'number');
+    const locations = [];
+    const roads = [];
+
+    for (let i = 0; i < count; i++) {
+      const pointer = call(
+        'wasm_location_name', 'number', ['number'], [i]
+      );
+      locations.push(Module.UTF8ToString(pointer));
+    }
+
+    for (let i = 0; i < count; i++) {
+      for (let j = i + 1; j < count; j++) {
+        const cost = call(
+          'wasm_road_cost', 'number',
+          ['number', 'number'], [i, j]
+        );
+
+        if (cost !== 9999) {
+          const blocked = call(
+            'wasm_road_blocked', 'number',
+            ['number', 'number'], [i, j]
+          );
+          roads.push([locations[i], locations[j], cost, !!blocked]);
+        }
+      }
+    }
+
+    return { locations, roads };
+  },
+
+  findRoute(source, destination) {
+    const current = this.getMap();
+    const from = current.locations.indexOf(source);
+    const to = current.locations.indexOf(destination);
+
+    if (from < 0 || to < 0) {
+      throw new Error('Choose valid source and destination locations.');
+    }
+
+    const found = call(
+      'wasm_find_route', 'number',
+      ['number', 'number'], [from, to]
+    );
+
+    if (found !== 1) return { found: false };
+
+    const length = call('wasm_route_length', 'number');
+    const route = [];
+
+    for (let i = 0; i < length; i++) {
+      const index = call('wasm_route_at', 'number', ['number'], [i]);
+      route.push(current.locations[index]);
+    }
+
+    const totalCost = call('wasm_route_total_cost', 'number');
+
+    return {
+      found: true,
+      route,
+      totalCost,
+      estimatedTimeMinutes: totalCost * 2
+    };
+  }
+};
+
+function rebuildEngine() {
+  engine.init();
+
+  for (const name of map.locations) {
+    const result = engine.addLocation(name);
+    if (result < 0) throw new Error(`Could not add location: ${name}`);
+  }
+
+  for (const [from, to, originalCost, manuallyBlocked] of map.roads) {
+    let cost = originalCost;
+    let weatherBlocked = false;
+
+    if (weather === 'Heavy Rain') cost = Math.round(cost * 1.5);
+    if (weather === 'Thunderstorm') cost = cost * 2;
+
+    if (weather === 'Flood' &&
+        (from === 'DisasterZone' || to === 'DisasterZone')) {
+      weatherBlocked = true;
+    }
+
+    if (weather === 'Landslide' &&
+        (from === 'ClementTown' || to === 'ClementTown')) {
+      weatherBlocked = true;
+    }
+
+    const result = engine.addRoad(from, to, cost);
+    if (result !== 1) throw new Error(`Could not add road: ${from} - ${to}`);
+
+    if (manuallyBlocked || weatherBlocked) {
+      engine.setBlocked(from, to, true);
+    }
+  }
+}
+
+function send(res, status, obj) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+  });
+  res.end(JSON.stringify(obj));
+}
+
+function publicError(res, error, status = 400) {
+  send(res, status, { error: error.message || String(error) });
+}
+
+async function handleApi(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const route = url.pathname;
+  let data = {};
+
+  if (req.method !== 'GET') {
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 16384) throw new Error('Request body is too large.');
+    }
+
+    try {
+      data = JSON.parse(body || '{}');
+    } catch {
+      return send(res, 400, { error: 'Invalid JSON request body.' });
+    }
+  }
+
+  try {
+    if (route === '/api/map' && req.method === 'GET') {
+      return send(res, 200, engine.getMap());
+    }
+
+    if (route === '/api/weather' && req.method === 'GET') {
+      return send(res, 200, { weather, map: engine.getMap() });
+    }
+
+    if (route === '/api/weather' && req.method === 'POST') {
+      const scenario = String(data.scenario || '');
+
+      const allowed = [
+        'Clear', 'Heavy Rain', 'Thunderstorm', 'Flood', 'Landslide'
+      ];
+
+      if (!allowed.includes(scenario)) {
+        throw new Error('Choose a valid weather scenario.');
+      }
+
+      weather = scenario;
+      rebuildEngine();
+
+      return send(res, 200, { weather, map: engine.getMap() });
+    }
+
+    if (route === '/api/route' && req.method === 'POST') {
+      const source = String(data.source || '');
+      const destination = String(data.destination || '');
+      const result = engine.findRoute(source, destination);
+
+      if (!result.found) {
+        return send(res, 200, {
+          reachable: false, source, destination
+        });
+      }
+
+      return send(res, 200, {
+        reachable: true,
+        path: result.route,
+        cost: result.totalCost,
+        minutes: result.estimatedTimeMinutes,
+        source,
+        destination
+      });
+    }
+
+    if (route === '/api/location' && req.method === 'POST') {
+      const name = String(data.name || '').trim();
+
+      if (!name || name.length > 29)
+        throw new Error('Name must be 1–29 characters.');
+      if (map.locations.length >= 20)
+        throw new Error('Map limit is 20 locations.');
+      if (map.locations.includes(name))
+        throw new Error('Location already exists.');
+
+      if (engine.addLocation(name) < 0)
+        throw new Error('C engine could not add this location.');
+
+      map.locations.push(name);
+      saveMap(map);
+      return send(res, 200, map);
+    }
+
+    if (route === '/api/road' && req.method === 'POST') {
+      const from = String(data.from || '');
+      const to = String(data.to || '');
+      const cost = Number(data.cost);
+
+      if (!map.locations.includes(from) ||
+          !map.locations.includes(to) || from === to)
+        throw new Error('Choose two different valid locations.');
+
+      if (!Number.isInteger(cost) || cost < 1 || cost >= 9999)
+        throw new Error('Road cost must be 1–9998.');
+
+      const old = map.roads.find(r =>
+        (r[0] === from && r[1] === to) ||
+        (r[0] === to && r[1] === from)
+      );
+
+      if (old) {
+        old[0] = from;
+        old[1] = to;
+        old[2] = cost;
+        old[3] = false;
+      } else {
+        map.roads.push([from, to, cost, false]);
+      }
+
+      rebuildEngine();
+      saveMap(map);
+      return send(res, 200, engine.getMap());
+    }
+
+    if (route === '/api/block' && req.method === 'POST') {
+      const from = String(data.from || '');
+      const to = String(data.to || '');
+
+      const road = map.roads.find(r =>
+        (r[0] === from && r[1] === to) ||
+        (r[0] === to && r[1] === from)
+      );
+
+      if (!road) throw new Error('No direct road exists.');
+
+      road[3] = !road[3];
+
+      rebuildEngine();
+      saveMap(map);
+      return send(res, 200, {
+        map: engine.getMap(),
+        blocked: road[3],
+        weather
+      });
+    }
+
+    if (route === '/api/reset' && req.method === 'POST') {
+      map = JSON.parse(JSON.stringify(seed));
+      weather = 'Clear';
+      rebuildEngine();
+      saveMap(map);
+      return send(res, 200, map);
+    }
+
+    return send(res, 404, { error: 'API route not found.' });
+  } catch (error) {
+    return publicError(res, error);
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+    });
+    return res.end();
+  }
+
+  if (req.url.startsWith('/api/')) {
+    return handleApi(req, res).catch(error => publicError(res, error, 500));
+  }
+
+  const requested = req.url.split('?')[0];
+  const file = requested === '/' ? '/index.html' : requested;
+  const full = path.resolve(PUBLIC, `.${path.normalize(file)}`);
+
+  if (!full.startsWith(PUBLIC + path.sep) && full !== PUBLIC) {
+    return send(res, 403, { error: 'Forbidden' });
+  }
+
+  fs.readFile(full, (error, content) => {
+    if (error) {
+      res.writeHead(404);
+      return res.end('Not found');
+    }
+
+    const types = {
+      '.html': 'text/html; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.js': 'application/javascript; charset=utf-8',
+      '.wasm': 'application/wasm'
+    };
+
+    res.writeHead(200, {
+      'Content-Type': types[path.extname(full)] ||
+        'application/octet-stream'
+    });
+    res.end(content);
+  });
+});
+
+(async () => {
+  try {
+    Module = await createRescueModule();
+    rebuildEngine();
+
+    server.listen(PORT, () => {
+      console.log(`Rescue Navigator running at http://localhost:${PORT}`);
+      console.log('Runtime engine: C WebAssembly (Dijkstra)');
+    });
+  } catch (error) {
+    console.error(`Unable to initialize C WebAssembly engine: ${error.message}`);
+    process.exit(1);
+  }
+})();
+
+process.on('SIGINT', () => {
+  server.close(() => process.exit(0));
+});
+
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
+});

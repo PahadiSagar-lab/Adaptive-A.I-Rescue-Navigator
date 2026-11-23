@@ -1,0 +1,13 @@
+{
+  "name": "adaptive-ai-rescue-navigator",
+  "version": "1.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node server-wasm.js",
+    "build:c:windows": "gcc -std=c99 -O2 rescue_adapter.c -o rescue_engine.exe",
+    "build:c": "gcc -std=c99 -O2 rescue_adapter.c -o rescue_engine"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

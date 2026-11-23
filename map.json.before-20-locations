@@ -1,0 +1,41 @@
+{
+  "locations": [
+    "RescueCenter",
+    "Hospital",
+    "ISBT",
+    "ClementTown",
+    "DisasterZone"
+  ],
+  "roads": [
+    [
+      "RescueCenter",
+      "Hospital",
+      4,
+      false
+    ],
+    [
+      "RescueCenter",
+      "ISBT",
+      6,
+      false
+    ],
+    [
+      "Hospital",
+      "ClementTown",
+      3,
+      true
+    ],
+    [
+      "ISBT",
+      "ClementTown",
+      2,
+      false
+    ],
+    [
+      "ClementTown",
+      "DisasterZone",
+      5,
+      false
+    ]
+  ]
+}
